@@ -7,32 +7,23 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, OptionsFlow
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
-from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.selector import (
+    EntitySelector,
+    EntitySelectorConfig,
+)
 
 from .const import CONF_NAME, CONF_SOURCES, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
 
-def _parse_sources(raw: str) -> list[str]:
-    """Parse a comma-separated string into a list of entity IDs."""
-    return [s.strip() for s in raw.split(",") if s.strip()]
-
-
-def _validate_sources(hass: HomeAssistant, sources: list[str]) -> list[str]:
-    """Return list of error keys, empty if all valid."""
-    errors = []
+def _validate_sources(sources: list[str]) -> str | None:
+    """Return error key if sources are invalid, else None."""
     if not sources:
-        errors.append("no_sources")
-        return errors
-    for entity_id in sources:
-        state = hass.states.get(entity_id)
-        if state is None or not entity_id.startswith("weather."):
-            errors.append("invalid_entity")
-            break
-    return errors
+        return "no_sources"
+    return None
 
 
 class WeatherMedianConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -46,12 +37,14 @@ class WeatherMedianConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            sources = _parse_sources(user_input[CONF_SOURCES])
-            error_keys = _validate_sources(self.hass, sources)
+            sources: list[str] = user_input[CONF_SOURCES]
+            error = _validate_sources(sources)
 
-            if not error_keys:
+            if not error:
                 name = user_input[CONF_NAME].strip()
-                await self.async_set_unique_id(f"weather_median_{name.lower().replace(' ', '_')}")
+                await self.async_set_unique_id(
+                    f"weather_median_{name.lower().replace(' ', '_')}"
+                )
                 self._abort_if_unique_id_configured()
 
                 return self.async_create_entry(
@@ -62,21 +55,19 @@ class WeatherMedianConfigFlow(ConfigFlow, domain=DOMAIN):
                     },
                 )
             else:
-                for key in error_keys:
-                    errors["base"] = key
+                errors["base"] = error
 
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_NAME, default="Weer mediaan"): str,
-                    vol.Required(CONF_SOURCES): str,
+                    vol.Required(CONF_NAME, default="Weather Median"): str,
+                    vol.Required(CONF_SOURCES): EntitySelector(
+                        EntitySelectorConfig(domain="weather", multiple=True)
+                    ),
                 }
             ),
             errors=errors,
-            description_placeholders={
-                "example": "weather.home, weather.buienradar, weather.google"
-            },
         )
 
     @staticmethod
@@ -96,27 +87,27 @@ class WeatherMedianOptionsFlow(OptionsFlow):
     ) -> FlowResult:
         errors: dict[str, str] = {}
 
-        current_sources = self._config_entry.data.get(CONF_SOURCES, [])
-        current_sources_str = ", ".join(current_sources)
+        current_sources: list[str] = self._config_entry.data.get(CONF_SOURCES, [])
 
         if user_input is not None:
-            sources = _parse_sources(user_input[CONF_SOURCES])
-            error_keys = _validate_sources(self.hass, sources)
+            sources: list[str] = user_input[CONF_SOURCES]
+            error = _validate_sources(sources)
 
-            if not error_keys:
+            if not error:
                 return self.async_create_entry(
                     title="",
                     data={CONF_SOURCES: sources},
                 )
             else:
-                for key in error_keys:
-                    errors["base"] = key
+                errors["base"] = error
 
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_SOURCES, default=current_sources_str): str,
+                    vol.Required(CONF_SOURCES, default=current_sources): EntitySelector(
+                        EntitySelectorConfig(domain="weather", multiple=True)
+                    ),
                 }
             ),
             errors=errors,
