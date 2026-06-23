@@ -2,30 +2,31 @@
   "config": {
     "step": {
       "user": {
-        "title": "Weather Median setup",
-        "description": "Add entity IDs of weather entities, seperated by commas",
+        "title": "Set up Weather Median",
         "data": {
           "name": "Name",
-          "sources": "Weather sources (seperated by commas)"
+          "sources": "Weather sources"
         }
       }
     },
     "error": {
-      "no_sources": "Add at least 1 weather entity.",
-      "invalid_entity": "One or more weather entities were unavailable or not found."
+      "no_sources": "Please select at least one weather entity."
     },
     "abort": {
-      "already_configured": "This combination is already configured."
+      "already_configured": "This name is already configured."
     }
   },
   "options": {
     "step": {
       "init": {
-        "title": "Edit sources",
+        "title": "Edit weather sources",
         "data": {
-          "sources": "Weather sources (seperated by commas)"
+          "sources": "Weather sources"
         }
       }
+    },
+    "error": {
+      "no_sources": "Please select at least one weather entity."
     }
   }
 }
