@@ -19,13 +19,12 @@ The median is more robust than the average — if one source reports an outlier 
 ## Installation
 
 ### Via HACS (recommended)
-
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Xornop&repository=HA-Median-Weather)
+or:
 1. Open HACS in Home Assistant
 2. Go to **Integrations**
 3. Click the three dots in the top right → **Custom repositories**
 4. Add `https://github.com/Xornop/ha-median-weather` as category **Integration**
-or just click 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Xornop&repository=HA-Median-Weather)
 5. Search for **HA Median Weather** and install it
 6. Restart Home Assistant
 
