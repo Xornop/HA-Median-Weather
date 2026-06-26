@@ -2,5 +2,6 @@ DOMAIN = "weather_median"
 
 CONF_SOURCES = "sources"
 CONF_NAME = "name"
+CONF_UPDATE_INTERVAL = "update_interval"
 
-UPDATE_INTERVAL_MINUTES = 60
+DEFAULT_UPDATE_INTERVAL = 60  # minutes
