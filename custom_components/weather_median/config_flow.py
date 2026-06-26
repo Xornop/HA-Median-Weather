@@ -12,9 +12,12 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.selector import (
     EntitySelector,
     EntitySelectorConfig,
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
 )
 
-from .const import CONF_NAME, CONF_SOURCES, DOMAIN
+from .const import CONF_NAME, CONF_SOURCES, CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -52,6 +55,7 @@ class WeatherMedianConfigFlow(ConfigFlow, domain=DOMAIN):
                     data={
                         CONF_NAME: name,
                         CONF_SOURCES: sources,
+                        CONF_UPDATE_INTERVAL: user_input[CONF_UPDATE_INTERVAL],
                     },
                 )
             else:
@@ -59,14 +63,15 @@ class WeatherMedianConfigFlow(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_NAME, default="Weather Median"): str,
-                    vol.Required(CONF_SOURCES): EntitySelector(
-                        EntitySelectorConfig(domain="weather", multiple=True)
-                    ),
-                }
-            ),
+            data_schema=vol.Schema({
+                vol.Required(CONF_NAME, default="Weather Median"): str,
+                vol.Required(CONF_SOURCES): EntitySelector(
+                    EntitySelectorConfig(domain="weather", multiple=True)
+                ),
+                vol.Required(CONF_UPDATE_INTERVAL, default=DEFAULT_UPDATE_INTERVAL): NumberSelector(
+                    NumberSelectorConfig(min=5, max=1440, step=5, mode=NumberSelectorMode.BOX, unit_of_measurement="min")
+                ),
+            }),
             errors=errors,
         )
 
@@ -88,6 +93,7 @@ class WeatherMedianOptionsFlow(OptionsFlow):
         errors: dict[str, str] = {}
 
         current_sources: list[str] = self._config_entry.data.get(CONF_SOURCES, [])
+        current_interval: int = self._config_entry.data.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)
 
         if user_input is not None:
             sources: list[str] = user_input[CONF_SOURCES]
@@ -96,19 +102,23 @@ class WeatherMedianOptionsFlow(OptionsFlow):
             if not error:
                 return self.async_create_entry(
                     title="",
-                    data={CONF_SOURCES: sources},
+                    data={
+                        CONF_SOURCES: sources,
+                        CONF_UPDATE_INTERVAL: user_input[CONF_UPDATE_INTERVAL],
+                    },
                 )
             else:
                 errors["base"] = error
 
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_SOURCES, default=current_sources): EntitySelector(
-                        EntitySelectorConfig(domain="weather", multiple=True)
-                    ),
-                }
-            ),
+            data_schema=vol.Schema({
+                vol.Required(CONF_SOURCES, default=current_sources): EntitySelector(
+                    EntitySelectorConfig(domain="weather", multiple=True)
+                ),
+                vol.Required(CONF_UPDATE_INTERVAL, default=current_interval): NumberSelector(
+                    NumberSelectorConfig(min=5, max=1440, step=5, mode=NumberSelectorMode.BOX, unit_of_measurement="min")
+                ),
+            }),
             errors=errors,
         )
