@@ -30,13 +30,10 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
-from homeassistant.util import dt as dt_util
 
-from .const import CONF_NAME, CONF_SOURCES, DOMAIN, UPDATE_INTERVAL_MINUTES
+from .const import CONF_NAME, CONF_SOURCES, CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
-
-FORECAST_TYPES = ("daily", "hourly")
 
 
 async def async_setup_entry(
@@ -45,10 +42,10 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the Weather Median entity."""
-    # Merge data and options — options override data when sources are edited
     config = dict(entry.data)
     if entry.options:
         config[CONF_SOURCES] = entry.options.get(CONF_SOURCES, config[CONF_SOURCES])
+        config[CONF_UPDATE_INTERVAL] = entry.options.get(CONF_UPDATE_INTERVAL, config.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL))
 
     entity = WeatherMedianEntity(hass, config, entry.entry_id)
     async_add_entities([entity], update_before_add=True)
@@ -62,17 +59,11 @@ def _median(values: list[float]) -> float | None:
 
 
 def _circular_median(degrees: list[float]) -> float | None:
-    """
-    Approximate circular median for wind bearing.
-    Uses the mean angle of the two middle values after sorting on the unit circle.
-    Good enough for weather sources that are typically close together.
-    """
+    """Approximate circular median for wind bearing via mean vector."""
     if not degrees:
         return None
     if len(degrees) == 1:
         return degrees[0]
-
-    # Convert to radians, compute mean vector
     rads = [math.radians(d) for d in degrees]
     sin_sum = sum(math.sin(r) for r in rads)
     cos_sum = sum(math.cos(r) for r in rads)
@@ -107,19 +98,15 @@ class WeatherMedianEntity(WeatherEntity):
         self._sources: list[str] = config[CONF_SOURCES]
         self._name: str = config[CONF_NAME]
         self._entry_id = entry_id
+        self._update_interval = timedelta(
+            minutes=int(config.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL))
+        )
 
         self._attr_unique_id = f"{DOMAIN}_{entry_id}"
         self._attr_name = self._name
 
-        # Cached forecast data keyed by (source, type)
         self._forecast_cache: dict[tuple[str, str], list[dict]] = {}
-
-        # Which sources support which forecast type — discovered on first update
-        self._supports: dict[str, set[str]] = {}  # entity_id -> {"daily", "hourly"}
-
-        # Supported features — set after discovery
         self._attr_supported_features = WeatherEntityFeature(0)
-
         self._remove_time_listener = None
 
     async def async_added_to_hass(self) -> None:
@@ -129,7 +116,7 @@ class WeatherMedianEntity(WeatherEntity):
         self._remove_time_listener = async_track_time_interval(
             self.hass,
             self._async_scheduled_update,
-            timedelta(minutes=UPDATE_INTERVAL_MINUTES),
+            self._update_interval,
         )
 
     async def async_will_remove_from_hass(self) -> None:
@@ -142,10 +129,7 @@ class WeatherMedianEntity(WeatherEntity):
         self.async_write_ha_state()
 
     async def _async_update_forecasts(self) -> None:
-        """
-        Fetch forecasts from all sources.
-        Discovers which sources support daily/hourly on the fly.
-        """
+        """Fetch forecasts from all sources, auto-discovering daily/hourly support."""
         supports_daily = []
         supports_hourly = []
 
@@ -154,15 +138,12 @@ class WeatherMedianEntity(WeatherEntity):
             if state is None:
                 _LOGGER.warning("Weather source %s not found, skipping.", source)
                 continue
-
             supported = state.attributes.get("supported_features", 0)
-            # WeatherEntityFeature.FORECAST_DAILY = 1, FORECAST_HOURLY = 2
             if supported & 1:
                 supports_daily.append(source)
             if supported & 2:
                 supports_hourly.append(source)
 
-        # Fetch daily
         if supports_daily:
             try:
                 response = await self.hass.services.async_call(
@@ -179,7 +160,6 @@ class WeatherMedianEntity(WeatherEntity):
             except Exception as err:
                 _LOGGER.error("Error fetching daily forecasts: %s", err)
 
-        # Fetch hourly
         if supports_hourly:
             try:
                 response = await self.hass.services.async_call(
@@ -196,7 +176,6 @@ class WeatherMedianEntity(WeatherEntity):
             except Exception as err:
                 _LOGGER.error("Error fetching hourly forecasts: %s", err)
 
-        # Update supported features based on what we actually got
         features = WeatherEntityFeature(0)
         if supports_daily:
             features |= WeatherEntityFeature.FORECAST_DAILY
@@ -284,12 +263,7 @@ class WeatherMedianEntity(WeatherEntity):
     # --- Forecasts ---
 
     def _build_median_forecast(self, forecast_type: str) -> list[Forecast]:
-        """
-        Build a median forecast list from all cached sources for the given type.
-        Uses the first available source as the leading datetime spine.
-        Sources without a matching datetime slot are skipped for that slot.
-        """
-        # Collect all cached forecasts for this type
+        """Build a median forecast from all cached sources for the given type."""
         available: list[list[dict]] = []
         for source in self._sources:
             cached = self._forecast_cache.get((source, forecast_type))
@@ -299,7 +273,6 @@ class WeatherMedianEntity(WeatherEntity):
         if not available:
             return []
 
-        # Use the first source as the datetime spine
         lead = available[0]
         result: list[Forecast] = []
 
@@ -313,43 +286,26 @@ class WeatherMedianEntity(WeatherEntity):
             )
 
             for fc in available:
-                # Find matching slot by datetime
                 slot = next(
                     (s for s in fc if s.get(ATTR_FORECAST_TIME) == dt), None
                 )
                 if slot is None:
                     continue
 
-                if (v := slot.get(ATTR_FORECAST_TEMP)) is not None:
-                    try:
-                        temps.append(float(v))
-                    except (TypeError, ValueError):
-                        pass
-                if (v := slot.get(ATTR_FORECAST_TEMP_LOW)) is not None:
-                    try:
-                        templows.append(float(v))
-                    except (TypeError, ValueError):
-                        pass
-                if (v := slot.get(ATTR_FORECAST_WIND_SPEED)) is not None:
-                    try:
-                        winds.append(float(v))
-                    except (TypeError, ValueError):
-                        pass
-                if (v := slot.get(ATTR_FORECAST_WIND_BEARING)) is not None:
-                    try:
-                        bearings.append(float(v))
-                    except (TypeError, ValueError):
-                        pass
-                if (v := slot.get(ATTR_FORECAST_PRECIPITATION)) is not None:
-                    try:
-                        precips.append(float(v))
-                    except (TypeError, ValueError):
-                        pass
-                if (v := slot.get(ATTR_FORECAST_HUMIDITY)) is not None:
-                    try:
-                        humids.append(float(v))
-                    except (TypeError, ValueError):
-                        pass
+                for val, lst in [
+                    (slot.get(ATTR_FORECAST_TEMP), temps),
+                    (slot.get(ATTR_FORECAST_TEMP_LOW), templows),
+                    (slot.get(ATTR_FORECAST_WIND_SPEED), winds),
+                    (slot.get(ATTR_FORECAST_WIND_BEARING), bearings),
+                    (slot.get(ATTR_FORECAST_PRECIPITATION), precips),
+                    (slot.get(ATTR_FORECAST_HUMIDITY), humids),
+                ]:
+                    if val is not None:
+                        try:
+                            lst.append(float(val))
+                        except (TypeError, ValueError):
+                            pass
+
                 if (v := slot.get(ATTR_FORECAST_CONDITION)) is not None:
                     conditions.append(str(v))
 
@@ -375,13 +331,10 @@ class WeatherMedianEntity(WeatherEntity):
         return result
 
     async def async_forecast_daily(self) -> list[Forecast] | None:
-        """Return daily forecast."""
         return self._build_median_forecast("daily") or None
 
     async def async_forecast_hourly(self) -> list[Forecast] | None:
-        """Return hourly forecast."""
         return self._build_median_forecast("hourly") or None
 
     async def async_update(self) -> None:
-        """Called by HA — refresh forecast cache."""
         await self._async_update_forecasts()
