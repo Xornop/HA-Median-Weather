@@ -308,27 +308,79 @@ class WeatherMedianEntity(WeatherEntity):
                 [], [], [], [], [], [], []
             )
 
-            for fc in available:
+            for source, fc in zip(self._sources, available):
                 slot = next(
-                    (s for s in fc if s.get(ATTR_FORECAST_TIME) == dt), None
+                    (s for s in fc if s.get(ATTR_FORECAST_TIME) == dt),
+                    None,
                 )
                 if slot is None:
                     continue
-
-                for val, lst in [
-                    (slot.get(ATTR_FORECAST_TEMP), temps),
-                    (slot.get(ATTR_FORECAST_TEMP_LOW), templows),
-                    (slot.get(ATTR_FORECAST_WIND_SPEED), winds),
-                    (slot.get(ATTR_FORECAST_WIND_BEARING), bearings),
-                    (slot.get(ATTR_FORECAST_PRECIPITATION), precips),
-                    (slot.get(ATTR_FORECAST_HUMIDITY), humids),
-                ]:
-                    if val is not None:
-                        try:
-                            lst.append(float(val))
-                        except (TypeError, ValueError):
-                            pass
-
+            
+                state = self.hass.states.get(source)
+                temp_unit = (
+                    state.attributes.get("temperature_unit", self.native_temperature_unit)
+                    if state
+                    else self.native_temperature_unit
+                )
+            
+                # Temperature
+                val = slot.get(ATTR_FORECAST_TEMP)
+                if val is not None:
+                    try:
+                        val = TemperatureConverter.convert(
+                            float(val),
+                            temp_unit,
+                            self.native_temperature_unit,
+                        )
+                        temps.append(val)
+                    except (TypeError, ValueError):
+                        pass
+            
+                # Low temperature
+                val = slot.get(ATTR_FORECAST_TEMP_LOW)
+                if val is not None:
+                    try:
+                        val = TemperatureConverter.convert(
+                            float(val),
+                            temp_unit,
+                            self.native_temperature_unit,
+                        )
+                        templows.append(val)
+                    except (TypeError, ValueError):
+                        pass
+            
+                # Wind speed
+                val = slot.get(ATTR_FORECAST_WIND_SPEED)
+                if val is not None:
+                    try:
+                        winds.append(float(val))
+                    except (TypeError, ValueError):
+                        pass
+            
+                # Wind bearing
+                val = slot.get(ATTR_FORECAST_WIND_BEARING)
+                if val is not None:
+                    try:
+                        bearings.append(float(val))
+                    except (TypeError, ValueError):
+                        pass
+            
+                # Precipitation
+                val = slot.get(ATTR_FORECAST_PRECIPITATION)
+                if val is not None:
+                    try:
+                        precips.append(float(val))
+                    except (TypeError, ValueError):
+                        pass
+            
+                # Humidity
+                val = slot.get(ATTR_FORECAST_HUMIDITY)
+                if val is not None:
+                    try:
+                        humids.append(float(val))
+                    except (TypeError, ValueError):
+                        pass
+            
                 if (v := slot.get(ATTR_FORECAST_CONDITION)) is not None:
                     conditions.append(str(v))
 
