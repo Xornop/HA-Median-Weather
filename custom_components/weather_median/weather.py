@@ -61,7 +61,6 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the Weather Median entity."""
     config = dict(entry.data)
     if entry.options:
         config[CONF_SOURCES] = entry.options.get(CONF_SOURCES, config[CONF_SOURCES])
@@ -72,16 +71,13 @@ async def async_setup_entry(
 
 
 def _median(values: list[float]) -> float | None:
-    if not values:
-        return None
+    if not values: return None
     return statistics.median(values)
 
 
 def _circular_median(degrees: list[float]) -> float | None:
-    if not degrees:
-        return None
-    if len(degrees) == 1:
-        return degrees[0]
+    if not degrees: return None
+    if len(degrees) == 1: return degrees[0]
     rads = [math.radians(d) for d in degrees]
     sin_sum = sum(math.sin(r) for r in rads)
     cos_sum = sum(math.cos(r) for r in rads)
@@ -90,18 +86,14 @@ def _circular_median(degrees: list[float]) -> float | None:
 
 
 def _majority_vote(values: list[str]) -> str | None:
-    if not values:
-        return None
+    if not values: return None
     return max(set(values), key=values.count)
 
 
 def _to_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+    if value is None: return None
+    try: return float(value)
+    except (TypeError, ValueError): return None
 
 
 class WeatherMedianEntity(WeatherEntity):
@@ -128,8 +120,7 @@ class WeatherMedianEntity(WeatherEntity):
         self._remove_time_listener = async_track_time_interval(self.hass, self._async_scheduled_update, self._update_interval)
 
     async def async_will_remove_from_hass(self) -> None:
-        if self._remove_time_listener:
-            self._remove_time_listener()
+        if self._remove_time_listener: self._remove_time_listener()
 
     async def _async_scheduled_update(self, _now=None) -> None:
         await self._async_update_forecasts()
@@ -169,7 +160,7 @@ class WeatherMedianEntity(WeatherEntity):
             try:
                 resp = await self.hass.services.async_call("weather", "get_forecasts", {"type": f_type}, return_response=True, target={"entity_id": targets})
                 for src in targets:
-                    if src in resp:
+                    if resp and src in resp:
                         state = self.hass.states.get(src)
                         attrs = state.attributes if state else {}
                         self._forecast_cache[(src, f_type)] = {
@@ -217,7 +208,10 @@ class WeatherMedianEntity(WeatherEntity):
     @property
     def condition(self) -> str | None: return _majority_vote([s.state for s in self._get_source_states() if s.state not in ("unavailable", "unknown", "")])
 
-    def _build_median_forecast(self, f_type: str) -> list[Forecast]:
+    async def _build_median_forecast(self, f_type: str) -> list[Forecast]:
+        if not any(k[1] == f_type for k in self._forecast_cache):
+            await self._async_update_forecasts()
+            
         available = [(src, self._forecast_cache[(src, f_type)]["data"], self._forecast_cache[(src, f_type)]["units"]) 
                      for src in self._sources if (src, f_type) in self._forecast_cache]
         
@@ -226,10 +220,8 @@ class WeatherMedianEntity(WeatherEntity):
         timeline = set()
         for _, slots, _ in available:
             for s in slots:
-                # Parse tijdstip: ondersteun zowel string als datetime
                 raw_dt = s.get(ATTR_FORECAST_TIME)
                 dt = dt_util.parse_datetime(raw_dt) if isinstance(raw_dt, str) else raw_dt
-                
                 if dt and dt.minute == 0:
                     timeline.add(dt)
         
@@ -239,9 +231,7 @@ class WeatherMedianEntity(WeatherEntity):
         for dt in sorted_timeline:
             temps, templows, winds, bearings, precips, humids, conds = [], [], [], [], [], [], []
             for src, slots, units in available:
-                # Zoek de slot
                 slot = next((s for s in slots if (parsed := (dt_util.parse_datetime(s.get(ATTR_FORECAST_TIME)) if isinstance(s.get(ATTR_FORECAST_TIME), str) else s.get(ATTR_FORECAST_TIME))) == dt), None)
-                
                 if slot:
                     if (v := _to_float(slot.get(ATTR_FORECAST_TEMP))) is not None and (c := self._convert_temperature(v, units.get(ATTR_TEMPERATURE_UNIT))) is not None: temps.append(c)
                     if (v := _to_float(slot.get(ATTR_FORECAST_TEMP_LOW))) is not None and (c := self._convert_temperature(v, units.get(ATTR_TEMPERATURE_UNIT))) is not None: templows.append(c)
@@ -262,6 +252,6 @@ class WeatherMedianEntity(WeatherEntity):
             res.append(ent)
         return res
 
-    async def async_forecast_daily(self) -> list[Forecast] | None: return self._build_median_forecast("daily") or None
-    async def async_forecast_hourly(self) -> list[Forecast] | None: return self._build_median_forecast("hourly") or None
+    async def async_forecast_daily(self) -> list[Forecast] | None: return await self._build_median_forecast("daily") or None
+    async def async_forecast_hourly(self) -> list[Forecast] | None: return await self._build_median_forecast("hourly") or None
     async def async_update(self) -> None: await self._async_update_forecasts()
