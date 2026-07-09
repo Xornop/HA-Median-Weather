@@ -73,5 +73,5 @@ After setup, click **Configure** on the integration to change:
 ## Notes
 
 - If a source is unavailable, it is skipped and the median is calculated from the remaining sources
-- Forecast slots are matched by datetime — if a source does not have a matching time slot, it is skipped for that slot
+- Forecast slots are matched by datetime on every whole hour — if a source does not have a matching time slot, it is skipped for that slot
 - The update interval controls how often the median is recalculated from the current HA state. It does not affect how often the underlying weather integrations poll their external APIs
