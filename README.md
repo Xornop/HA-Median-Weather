@@ -42,6 +42,7 @@ or:
 4. Select the weather sources you want to combine
 5. Set the update interval (default: 60 minutes)
 6. Click **Submit**
+7. Wait for at least the update interval time, it might take some time to update.
 
 The integration will create a `weather.<name>` entity.
 
