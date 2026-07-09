@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import math
 import statistics
-from datetime import timedelta
+from datetime import timedelta, datetime
 from typing import Any
 
 from homeassistant.components.weather import (
@@ -217,14 +217,27 @@ class WeatherMedianEntity(WeatherEntity):
     def condition(self) -> str | None: return _majority_vote([s.state for s in self._get_source_states() if s.state not in ("unavailable", "unknown", "")])
 
     def _build_median_forecast(self, f_type: str) -> list[Forecast]:
-        available = [(src, self._forecast_cache[(src, f_type)]["data"], self._forecast_cache[(src, f_type)]["units"]) for src in self._sources if (src, f_type) in self._forecast_cache]
+        available = [(src, self._forecast_cache[(src, f_type)]["data"], self._forecast_cache[(src, f_type)]["units"]) 
+                     for src in self._sources if (src, f_type) in self._forecast_cache]
+        
         if not available: return []
-        lead = available[0][1]
+
+        # Bouw een Master Timeline met enkel data op het hele uur (minuut == 0)
+        timeline = set()
+        for _, slots, _ in available:
+            for s in slots:
+                if (dt := s.get(ATTR_FORECAST_TIME)):
+                    # Forceer alleen hele uren
+                    if dt.minute == 0:
+                        timeline.add(dt)
+        
+        sorted_timeline = sorted(list(timeline))
         res = []
-        for l_slot in lead:
-            if not (dt := l_slot.get(ATTR_FORECAST_TIME)): continue
+
+        for dt in sorted_timeline:
             temps, templows, winds, bearings, precips, humids, conds = [], [], [], [], [], [], []
             for src, slots, units in available:
+                # Zoek de slot die exact overeenkomt met dit uur
                 if (slot := next((s for s in slots if s.get(ATTR_FORECAST_TIME) == dt), None)):
                     if (v := _to_float(slot.get(ATTR_FORECAST_TEMP))) is not None and (c := self._convert_temperature(v, units.get(ATTR_TEMPERATURE_UNIT))) is not None: temps.append(c)
                     if (v := _to_float(slot.get(ATTR_FORECAST_TEMP_LOW))) is not None and (c := self._convert_temperature(v, units.get(ATTR_TEMPERATURE_UNIT))) is not None: templows.append(c)
