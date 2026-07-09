@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import math
 import statistics
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, date, timedelta, timezone
 from typing import Any, Optional
 
 from homeassistant.components.weather import (
@@ -107,10 +107,15 @@ def _to_float(value: Any) -> float | None:
 
 
 def _parse_iso_datetime(value: Any) -> Optional[datetime]:
-    """Parse an ISO datetime string to a timezone-aware datetime in UTC.
+    """Parse an ISO datetime string or datetime to a timezone-aware datetime in UTC.
 
-    Returns None if parsing fails or value is not a string.
+    Returns None if parsing fails or value is not a string/datetime.
     """
+    if isinstance(value, datetime):
+        dt = value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
     if not isinstance(value, str):
         return None
     try:
@@ -118,12 +123,22 @@ def _parse_iso_datetime(value: Any) -> Optional[datetime]:
         if value.endswith("Z"):
             value = value[:-1] + "+00:00"
         dt = datetime.fromisoformat(value)
-        # Ensure timezone-aware in UTC
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
+
+
+def _normalize_time_to_iso_z(value: Any) -> Optional[str]:
+    """Return an ISO8601 Z-suffixed UTC string for the given time (str or datetime)."""
+    dt = _parse_iso_datetime(value)
+    if dt is None:
+        return None
+    # Remove microseconds for stable matching
+    dt = dt.replace(microsecond=0)
+    # Use Z for UTC
+    return dt.isoformat().replace("+00:00", "Z")
 
 
 class WeatherMedianEntity(WeatherEntity):
@@ -142,6 +157,7 @@ class WeatherMedianEntity(WeatherEntity):
         self._attr_unique_id = f"{DOMAIN}_{entry_id}"
         self._attr_name = self._name
         # forecast_cache maps (source, type) -> {"data": [...], "units": {...}}
+        # Each slot in "data" will have ATTR_FORECAST_TIME normalized to ISO Z string
         self._forecast_cache: dict[tuple[str, str], dict[str, Any]] = {}
         self._attr_supported_features = WeatherEntityFeature(0)
         self._remove_time_listener = None
@@ -176,6 +192,7 @@ class WeatherMedianEntity(WeatherEntity):
 
     @staticmethod
     def _convert_precipitation(v: float | None, u: str | None) -> float | None:
+        # Precipitation depth is treated as millimeters canonical
         return DistanceConverter.convert(v, u, CANONICAL_PRECIPITATION_UNIT) if v is not None and u else v
 
     async def _async_update_forecasts(self) -> None:
@@ -203,41 +220,53 @@ class WeatherMedianEntity(WeatherEntity):
                     target={"entity_id": targets},
                 )
                 for src in targets:
-                    if src in resp:
-                        state = self.hass.states.get(src)
-                        attrs = state.attributes if state else {}
-                        raw_forecast = resp[src].get("forecast", []) or []
+                    if src not in resp:
+                        # No response for this source
+                        if (src, f_type) in self._forecast_cache:
+                            del self._forecast_cache[(src, f_type)]
+                        continue
 
-                        # Filter hourly forecasts to whole-hour slots only.
+                    state = self.hass.states.get(src)
+                    attrs = state.attributes if state else {}
+                    raw_forecast = resp[src].get("forecast", []) or []
+
+                    # Normalize and optionally filter slots
+                    normalized_slots: list[dict[str, Any]] = []
+                    for slot in raw_forecast:
+                        raw_time = slot.get(ATTR_FORECAST_TIME)
+                        norm_time = _normalize_time_to_iso_z(raw_time)
+                        if norm_time is None:
+                            # Skip slots without a parseable time
+                            continue
+
+                        # For hourly forecasts, only keep whole-hour slots (minute == 0)
                         if f_type == "hourly":
-                            filtered = []
-                            for slot in raw_forecast:
-                                dt_raw = slot.get(ATTR_FORECAST_TIME)
-                                dt = _parse_iso_datetime(dt_raw)
-                                if dt is None:
-                                    # If we can't parse, skip the slot
-                                    continue
-                                # Keep only whole-hour slots (minute == 0)
-                                if dt.minute == 0:
-                                    filtered.append(slot)
-                        else:
-                            # daily: keep as-is
-                            filtered = raw_forecast
+                            dt = _parse_iso_datetime(raw_time)
+                            if dt is None:
+                                continue
+                            if dt.minute != 0:
+                                continue
 
-                        # Only store if there is at least one slot after filtering
-                        if filtered:
-                            self._forecast_cache[(src, f_type)] = {
-                                "data": filtered,
-                                "units": {
-                                    ATTR_TEMPERATURE_UNIT: attrs.get(ATTR_TEMPERATURE_UNIT),
-                                    ATTR_WIND_SPEED_UNIT: attrs.get(ATTR_WIND_SPEED_UNIT),
-                                    ATTR_PRECIPITATION_UNIT: attrs.get(ATTR_PRECIPITATION_UNIT),
-                                },
-                            }
-                        else:
-                            # Remove any previous cache for this source/type if no valid slots now
-                            if (src, f_type) in self._forecast_cache:
-                                del self._forecast_cache[(src, f_type)]
+                        # For daily forecasts we accept the slot as-is (we'll reduce per-source-per-day later)
+                        s_copy = dict(slot)
+                        s_copy[ATTR_FORECAST_TIME] = norm_time
+                        normalized_slots.append(s_copy)
+
+                    # If there are normalized slots, store them sorted by time
+                    if normalized_slots:
+                        normalized_slots.sort(key=lambda s: _parse_iso_datetime(s.get(ATTR_FORECAST_TIME)) or datetime.min.replace(tzinfo=timezone.utc))
+                        self._forecast_cache[(src, f_type)] = {
+                            "data": normalized_slots,
+                            "units": {
+                                ATTR_TEMPERATURE_UNIT: attrs.get(ATTR_TEMPERATURE_UNIT),
+                                ATTR_WIND_SPEED_UNIT: attrs.get(ATTR_WIND_SPEED_UNIT),
+                                ATTR_PRECIPITATION_UNIT: attrs.get(ATTR_PRECIPITATION_UNIT),
+                            },
+                        }
+                    else:
+                        # Remove any previous cache for this source/type if no valid slots now
+                        if (src, f_type) in self._forecast_cache:
+                            del self._forecast_cache[(src, f_type)]
             except Exception as e:
                 _LOGGER.error("Error fetching %s forecasts: %s", f_type, e)
 
@@ -311,27 +340,110 @@ class WeatherMedianEntity(WeatherEntity):
             if key in self._forecast_cache:
                 data = self._forecast_cache[key]["data"]
                 units = self._forecast_cache[key]["units"]
-                # Ensure data is sorted by time for deterministic output
-                def _slot_dt(slot):
-                    dt = _parse_iso_datetime(slot.get(ATTR_FORECAST_TIME))
-                    return dt or datetime.min.replace(tzinfo=timezone.utc)
-                data_sorted = sorted(data, key=_slot_dt)
-                available.append((src, data_sorted, units))
+                # data is already sorted when cached
+                available.append((src, data, units))
 
         if not available:
             return []
 
-        # Use the lead source (first available) as the timeline to iterate over
+        # DAILY: special handling to ensure 5 days if possible, otherwise use longest available
+        # IMPORTANT: only sources that provided daily forecasts (cached under 'daily') are considered here.
+        if f_type == "daily":
+            # For each source, reduce multiple slots per date to a single representative slot.
+            # Representative slot chosen as the slot with time closest to 12:00 UTC (midday).
+            per_source_best_slot: dict[str, dict[date, dict[str, Any]]] = {}
+            all_dates: set[date] = set()
+            for src, slots, _ in available:
+                best_for_dates: dict[date, dict[str, Any]] = {}
+                for slot in slots:
+                    dt = _parse_iso_datetime(slot.get(ATTR_FORECAST_TIME))
+                    if dt is None:
+                        continue
+                    d = dt.date()
+                    all_dates.add(d)
+                    # compute minutes from midnight and distance to 12:00 (720 minutes)
+                    minutes = dt.hour * 60 + dt.minute
+                    distance = abs(minutes - 720)
+                    # store slot with smallest distance to midday
+                    existing = best_for_dates.get(d)
+                    if existing is None:
+                        s_copy = dict(slot)
+                        s_copy["_midday_distance"] = distance
+                        best_for_dates[d] = s_copy
+                    else:
+                        if distance < existing.get("_midday_distance", 999999):
+                            s_copy = dict(slot)
+                            s_copy["_midday_distance"] = distance
+                            best_for_dates[d] = s_copy
+                per_source_best_slot[src] = best_for_dates
+
+            # Determine desired number of days: 5 if any source has 5 or more unique dates, else max length among sources
+            max_len = max((len(dates) for dates in (list(d.keys()) for d in per_source_best_slot.values())), default=0)
+            desired_count = 5 if any(len(dates) >= 5 for dates in (list(d.keys()) for d in per_source_best_slot.values())) else max_len
+
+            if desired_count == 0:
+                return []
+
+            # Choose the earliest desired_count dates from the union of dates
+            union_dates_sorted = sorted(all_dates)
+            chosen_dates = union_dates_sorted[:desired_count]
+
+            res: list[Forecast] = []
+            for chosen_date in chosen_dates:
+                # Build a canonical ISO Z time for the date (midnight UTC)
+                dt_midnight = datetime(chosen_date.year, chosen_date.month, chosen_date.day, 0, 0, tzinfo=timezone.utc)
+                dt_iso = dt_midnight.isoformat().replace("+00:00", "Z")
+
+                temps, templows, winds, bearings, precips, humids, conds = [], [], [], [], [], [], []
+                for src, _, units in available:
+                    best_slots_for_src = per_source_best_slot.get(src, {})
+                    slot = best_slots_for_src.get(chosen_date)
+                    if not slot:
+                        continue
+                    # extract values from the representative slot (ignore internal _midday_distance)
+                    if (v := _to_float(slot.get(ATTR_FORECAST_TEMP))) is not None and (c := self._convert_temperature(v, units.get(ATTR_TEMPERATURE_UNIT))) is not None:
+                        temps.append(c)
+                    if (v := _to_float(slot.get(ATTR_FORECAST_TEMP_LOW))) is not None and (c := self._convert_temperature(v, units.get(ATTR_TEMPERATURE_UNIT))) is not None:
+                        templows.append(c)
+                    if (v := _to_float(slot.get(ATTR_FORECAST_WIND_SPEED))) is not None and (c := self._convert_speed(v, units.get(ATTR_WIND_SPEED_UNIT))) is not None:
+                        winds.append(c)
+                    if (v := _to_float(slot.get(ATTR_FORECAST_WIND_BEARING))) is not None:
+                        bearings.append(v)
+                    if (v := _to_float(slot.get(ATTR_FORECAST_PRECIPITATION))) is not None and (c := self._convert_precipitation(v, units.get(ATTR_PRECIPITATION_UNIT))) is not None:
+                        precips.append(c)
+                    if (v := _to_float(slot.get(ATTR_FORECAST_HUMIDITY))) is not None:
+                        humids.append(v)
+                    if (v := slot.get(ATTR_FORECAST_CONDITION)):
+                        conds.append(str(v))
+
+                ent: Forecast = {ATTR_FORECAST_TIME: dt_iso}
+                if (v := _median(temps)) is not None:
+                    ent[ATTR_FORECAST_TEMP] = round(v, 1)
+                if (v := _median(templows)) is not None:
+                    ent[ATTR_FORECAST_TEMP_LOW] = round(v, 1)
+                if (v := _median(winds)) is not None:
+                    ent[ATTR_FORECAST_WIND_SPEED] = round(v, 1)
+                if (v := _circular_median(bearings)) is not None:
+                    ent[ATTR_FORECAST_WIND_BEARING] = round(v, 1)
+                if (v := _median(precips)) is not None:
+                    ent[ATTR_FORECAST_PRECIPITATION] = round(v, 2)
+                if (v := _median(humids)) is not None:
+                    ent[ATTR_FORECAST_HUMIDITY] = round(v, 1)
+                if (v := _majority_vote(conds)) is not None:
+                    ent[ATTR_FORECAST_CONDITION] = v
+                res.append(ent)
+            return res
+
+        # HOURLY: use lead timeline (already filtered to whole-hour slots when cached)
         lead = available[0][1]
         res: list[Forecast] = []
         for l_slot in lead:
-            dt_raw = l_slot.get(ATTR_FORECAST_TIME)
-            if not dt_raw:
+            dt_norm = l_slot.get(ATTR_FORECAST_TIME)
+            if not dt_norm:
                 continue
-            # Collect values from all sources that have a slot for this exact time
             temps, templows, winds, bearings, precips, humids, conds = [], [], [], [], [], [], []
             for src, slots, units in available:
-                slot = next((s for s in slots if s.get(ATTR_FORECAST_TIME) == dt_raw), None)
+                slot = next((s for s in slots if s.get(ATTR_FORECAST_TIME) == dt_norm), None)
                 if not slot:
                     continue
                 if (v := _to_float(slot.get(ATTR_FORECAST_TEMP))) is not None and (c := self._convert_temperature(v, units.get(ATTR_TEMPERATURE_UNIT))) is not None:
@@ -349,7 +461,7 @@ class WeatherMedianEntity(WeatherEntity):
                 if (v := slot.get(ATTR_FORECAST_CONDITION)):
                     conds.append(str(v))
 
-            ent: Forecast = {ATTR_FORECAST_TIME: dt_raw}
+            ent: Forecast = {ATTR_FORECAST_TIME: dt_norm}
             if (v := _median(temps)) is not None:
                 ent[ATTR_FORECAST_TEMP] = round(v, 1)
             if (v := _median(templows)) is not None:
