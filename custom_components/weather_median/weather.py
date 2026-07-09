@@ -22,6 +22,7 @@ from homeassistant.components.weather import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
+    ATTR_TEMPERATURE_UNIT,
     UnitOfLength,
     UnitOfPressure,
     UnitOfSpeed,
@@ -30,6 +31,7 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.util.unit_conversion import TemperatureConverter
 
 from .const import CONF_NAME, CONF_SOURCES, CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL, DOMAIN
 
@@ -45,7 +47,9 @@ async def async_setup_entry(
     config = dict(entry.data)
     if entry.options:
         config[CONF_SOURCES] = entry.options.get(CONF_SOURCES, config[CONF_SOURCES])
-        config[CONF_UPDATE_INTERVAL] = entry.options.get(CONF_UPDATE_INTERVAL, config.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL))
+        config[CONF_UPDATE_INTERVAL] = entry.options.get(
+            CONF_UPDATE_INTERVAL, config.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)
+        )
 
     entity = WeatherMedianEntity(hass, config, entry.entry_id)
     async_add_entities([entity], update_before_add=True)
@@ -156,7 +160,9 @@ class WeatherMedianEntity(WeatherEntity):
                 )
                 for source in supports_daily:
                     if source in response:
-                        self._forecast_cache[(source, "daily")] = response[source].get("forecast", [])
+                        self._forecast_cache[(source, "daily")] = response[source].get(
+                            "forecast", []
+                        )
             except Exception as err:
                 _LOGGER.error("Error fetching daily forecasts: %s", err)
 
@@ -172,7 +178,9 @@ class WeatherMedianEntity(WeatherEntity):
                 )
                 for source in supports_hourly:
                     if source in response:
-                        self._forecast_cache[(source, "hourly")] = response[source].get("forecast", [])
+                        self._forecast_cache[(source, "hourly")] = response[source].get(
+                            "forecast", []
+                        )
             except Exception as err:
                 _LOGGER.error("Error fetching hourly forecasts: %s", err)
 
@@ -198,14 +206,21 @@ class WeatherMedianEntity(WeatherEntity):
                 states.append(state)
         return states
 
-    def _attr_from_sources(self, attribute: str) -> list[float]:
-        """Collect numeric attribute values from all sources."""
+    def _attr_from_sources(self, attribute: str, is_temperature: bool = False) -> list[float]:
+        """Collect numeric attribute values from all sources, converting temperature if needed."""
         values = []
         for state in self._get_source_states():
             val = state.attributes.get(attribute)
             if val is not None:
                 try:
-                    values.append(float(val))
+                    float_val = float(val)
+                    if is_temperature:
+                        source_unit = state.attributes.get(ATTR_TEMPERATURE_UNIT)
+                        if source_unit and source_unit != self._attr_native_temperature_unit:
+                            float_val = TemperatureConverter.convert(
+                                float_val, source_unit, self._attr_native_temperature_unit
+                            )
+                    values.append(float_val)
                 except (TypeError, ValueError):
                     pass
         return values
@@ -214,11 +229,11 @@ class WeatherMedianEntity(WeatherEntity):
 
     @property
     def native_temperature(self) -> float | None:
-        return _median(self._attr_from_sources("temperature"))
+        return _median(self._attr_from_sources("temperature", is_temperature=True))
 
     @property
     def native_apparent_temperature(self) -> float | None:
-        return _median(self._attr_from_sources("apparent_temperature"))
+        return _median(self._attr_from_sources("apparent_temperature", is_temperature=True))
 
     @property
     def humidity(self) -> float | None:
@@ -250,7 +265,7 @@ class WeatherMedianEntity(WeatherEntity):
 
     @property
     def dew_point(self) -> float | None:
-        return _median(self._attr_from_sources("dew_point"))
+        return _median(self._attr_from_sources("dew_point", is_temperature=True))
 
     @property
     def condition(self) -> str | None:
@@ -265,10 +280,16 @@ class WeatherMedianEntity(WeatherEntity):
     def _build_median_forecast(self, forecast_type: str) -> list[Forecast]:
         """Build a median forecast from all cached sources for the given type."""
         available: list[list[dict]] = []
+        
+        # We need to look up the source state to find its temperature unit for forecast conversions
+        source_units: dict[str, str] = {}
         for source in self._sources:
             cached = self._forecast_cache.get((source, forecast_type))
             if cached:
                 available.append(cached)
+                state = self.hass.states.get(source)
+                if state:
+                    source_units[source] = state.attributes.get(ATTR_TEMPERATURE_UNIT, self._attr_native_temperature_unit)
 
         if not available:
             return []
@@ -286,23 +307,32 @@ class WeatherMedianEntity(WeatherEntity):
             )
 
             for fc in available:
+                # Find the source name belonging to this specific forecast list to get its unit
+                source_name = next((k[0] for k, v in self._forecast_cache.items() if v is fc and k[1] == forecast_type), None)
+                source_unit = source_units.get(source_name, self._attr_native_temperature_unit) if source_name else self._attr_native_temperature_unit
+
                 slot = next(
                     (s for s in fc if s.get(ATTR_FORECAST_TIME) == dt), None
                 )
                 if slot is None:
                     continue
 
-                for val, lst in [
-                    (slot.get(ATTR_FORECAST_TEMP), temps),
-                    (slot.get(ATTR_FORECAST_TEMP_LOW), templows),
-                    (slot.get(ATTR_FORECAST_WIND_SPEED), winds),
-                    (slot.get(ATTR_FORECAST_WIND_BEARING), bearings),
-                    (slot.get(ATTR_FORECAST_PRECIPITATION), precips),
-                    (slot.get(ATTR_FORECAST_HUMIDITY), humids),
+                for val, lst, is_temp in [
+                    (slot.get(ATTR_FORECAST_TEMP), temps, True),
+                    (slot.get(ATTR_FORECAST_TEMP_LOW), templows, True),
+                    (slot.get(ATTR_FORECAST_WIND_SPEED), winds, False),
+                    (slot.get(ATTR_FORECAST_WIND_BEARING), bearings, False),
+                    (slot.get(ATTR_FORECAST_PRECIPITATION), precips, False),
+                    (slot.get(ATTR_FORECAST_HUMIDITY), humids, False),
                 ]:
                     if val is not None:
                         try:
-                            lst.append(float(val))
+                            float_val = float(val)
+                            if is_temp and source_unit != self._attr_native_temperature_unit:
+                                float_val = TemperatureConverter.convert(
+                                    float_val, source_unit, self._attr_native_temperature_unit
+                                )
+                            lst.append(float_val)
                         except (TypeError, ValueError):
                             pass
 
