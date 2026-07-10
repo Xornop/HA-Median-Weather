@@ -4,8 +4,8 @@ from __future__ import annotations
 import logging
 import math
 import statistics
-from datetime import datetime, date, timedelta, timezone
-from typing import Any, Optional
+from datetime import timedelta
+from typing import Any
 
 from homeassistant.components.weather import (
     ATTR_FORECAST_CONDITION,
@@ -32,27 +32,51 @@ from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.util.unit_conversion import (
+    BaseUnitConverter,
     DistanceConverter,
     PressureConverter,
     SpeedConverter,
     TemperatureConverter,
 )
 
-from .const import CONF_NAME, CONF_SOURCES, CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL, DOMAIN
+from .const import (
+    CONF_NAME,
+    CONF_SOURCES,
+    CONF_UPDATE_INTERVAL,
+    DEFAULT_UPDATE_INTERVAL,
+    DOMAIN,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
+# Canonical internal units — every value is normalized to these before any
+# median is calculated, regardless of which unit each individual source
+# happens to report in. Home Assistant handles user-facing conversion
+# (e.g. to °F or mph) downstream, based on the native_*_unit properties.
 CANONICAL_TEMPERATURE_UNIT = UnitOfTemperature.CELSIUS
 CANONICAL_PRESSURE_UNIT = UnitOfPressure.HPA
 CANONICAL_SPEED_UNIT = UnitOfSpeed.KILOMETERS_PER_HOUR
 CANONICAL_DISTANCE_UNIT = UnitOfLength.KILOMETERS
 CANONICAL_PRECIPITATION_UNIT = UnitOfPrecipitationDepth.MILLIMETERS
 
+# Weather entity attribute keys that carry a per-entity unit alongside them.
 ATTR_TEMPERATURE_UNIT = "temperature_unit"
 ATTR_PRESSURE_UNIT = "pressure_unit"
 ATTR_WIND_SPEED_UNIT = "wind_speed_unit"
 ATTR_VISIBILITY_UNIT = "visibility_unit"
 ATTR_PRECIPITATION_UNIT = "precipitation_unit"
+
+# One entry per "kind" of measurement: which converter normalizes it, and
+# which canonical unit it's normalized to. Adding a new convertible
+# measurement only requires adding a row here — every call site (current
+# conditions and forecast) shares the same normalization logic.
+_CONVERTERS: dict[str, tuple[type[BaseUnitConverter], str]] = {
+    "temperature": (TemperatureConverter, CANONICAL_TEMPERATURE_UNIT),
+    "pressure": (PressureConverter, CANONICAL_PRESSURE_UNIT),
+    "speed": (SpeedConverter, CANONICAL_SPEED_UNIT),
+    "distance": (DistanceConverter, CANONICAL_DISTANCE_UNIT),
+    "precipitation": (DistanceConverter, CANONICAL_PRECIPITATION_UNIT),
+}
 
 
 async def async_setup_entry(
@@ -74,12 +98,14 @@ async def async_setup_entry(
 
 
 def _median(values: list[float]) -> float | None:
+    """Return the median of a list, or None if empty."""
     if not values:
         return None
     return statistics.median(values)
 
 
 def _circular_median(degrees: list[float]) -> float | None:
+    """Approximate circular median for wind bearing via mean vector."""
     if not degrees:
         return None
     if len(degrees) == 1:
@@ -92,12 +118,14 @@ def _circular_median(degrees: list[float]) -> float | None:
 
 
 def _majority_vote(values: list[str]) -> str | None:
+    """Return the most common string value."""
     if not values:
         return None
     return max(set(values), key=values.count)
 
 
 def _to_float(value: Any) -> float | None:
+    """Best-effort conversion of a raw value to float."""
     if value is None:
         return None
     try:
@@ -106,42 +134,18 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
-def _parse_iso_datetime(value: Any) -> Optional[datetime]:
-    """Parse an ISO datetime string or datetime to a timezone-aware datetime in UTC.
-
-    Returns None if parsing fails or value is not a string/datetime.
-    """
-    if isinstance(value, datetime):
-        dt = value
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    if not isinstance(value, str):
-        return None
-    try:
-        # Handle trailing Z (UTC) by replacing with +00:00 for fromisoformat
-        if value.endswith("Z"):
-            value = value[:-1] + "+00:00"
-        dt = datetime.fromisoformat(value)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-
-def _normalize_time_to_iso_z(value: Any) -> Optional[str]:
-    """Return an ISO8601 Z-suffixed UTC string for the given time (str or datetime)."""
-    dt = _parse_iso_datetime(value)
-    if dt is None:
-        return None
-    # Remove microseconds for stable matching
-    dt = dt.replace(microsecond=0)
-    # Use Z for UTC
-    return dt.isoformat().replace("+00:00", "Z")
-
-
 class WeatherMedianEntity(WeatherEntity):
+    """A weather entity that exposes the median of multiple weather sources.
+
+    Every source can legitimately report in a different unit — one
+    integration might be metric, another might be misconfigured or use an
+    older API that reports imperial units. Every numeric value is therefore
+    normalized to a canonical metric unit, *per source, per value*, using
+    that specific source's own reported unit, before it ever enters a
+    median calculation. This applies equally to current conditions and to
+    every forecast slot of every source.
+    """
+
     _attr_should_poll = False
     _attr_native_temperature_unit = CANONICAL_TEMPERATURE_UNIT
     _attr_native_pressure_unit = CANONICAL_PRESSURE_UNIT
@@ -149,24 +153,44 @@ class WeatherMedianEntity(WeatherEntity):
     _attr_native_visibility_unit = CANONICAL_DISTANCE_UNIT
     _attr_native_precipitation_unit = CANONICAL_PRECIPITATION_UNIT
 
-    def __init__(self, hass: HomeAssistant, config: dict[str, Any], entry_id: str) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config: dict[str, Any],
+        entry_id: str,
+    ) -> None:
         self.hass = hass
         self._sources: list[str] = config[CONF_SOURCES]
         self._name: str = config[CONF_NAME]
-        self._update_interval = timedelta(minutes=int(config.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)))
+        self._entry_id = entry_id
+        self._update_interval = timedelta(
+            minutes=int(config.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL))
+        )
+
         self._attr_unique_id = f"{DOMAIN}_{entry_id}"
         self._attr_name = self._name
-        # forecast_cache maps (source, type) -> {"data": [...], "units": {...}}
-        # Each slot in "data" will have ATTR_FORECAST_TIME normalized to ISO Z string
-        self._forecast_cache: dict[tuple[str, str], dict[str, Any]] = {}
+
+        # Cache keyed by source entity_id -> list of raw forecast dicts.
+        # Sources that don't support a forecast type simply have no entry,
+        # so a missing provider never shifts or misaligns the others.
+        self._forecast_cache: dict[str, list[dict]] = {}
+        self._forecast_cache_type: dict[str, str] = {}
+
         self._attr_supported_features = WeatherEntityFeature(0)
         self._remove_time_listener = None
 
     async def async_added_to_hass(self) -> None:
+        """Start periodic updates when entity is added."""
         await self._async_update_forecasts()
-        self._remove_time_listener = async_track_time_interval(self.hass, self._async_scheduled_update, self._update_interval)
+
+        self._remove_time_listener = async_track_time_interval(
+            self.hass,
+            self._async_scheduled_update,
+            self._update_interval,
+        )
 
     async def async_will_remove_from_hass(self) -> None:
+        """Clean up timer."""
         if self._remove_time_listener:
             self._remove_time_listener()
 
@@ -174,310 +198,379 @@ class WeatherMedianEntity(WeatherEntity):
         await self._async_update_forecasts()
         self.async_write_ha_state()
 
-    @staticmethod
-    def _convert_temperature(v: float | None, u: str | None) -> float | None:
-        return TemperatureConverter.convert(v, u, CANONICAL_TEMPERATURE_UNIT) if v is not None and u else v
+    # --- Unit normalization ---------------------------------------------------
+    #
+    # A single, reusable normalization path for every measurement "kind".
+    # Handles three real-world cases:
+    #   1. The source reports a unit and it already matches canonical -> no-op.
+    #   2. The source reports a unit that differs -> convert via HA's own
+    #      official converter.
+    #   3. The source doesn't report a unit at all -> fall back to whatever
+    #      Home Assistant's configured unit system uses for that
+    #      measurement, which is what most integrations implicitly assume
+    #      when they omit the attribute. If even that isn't available,
+    #      assume canonical as a last resort.
+    # A conversion that fails (e.g. an unrecognized/garbled unit string from
+    # a misbehaving source) is logged and excluded rather than allowed to
+    # raise and take down the whole aggregation.
 
-    @staticmethod
-    def _convert_pressure(v: float | None, u: str | None) -> float | None:
-        return PressureConverter.convert(v, u, CANONICAL_PRESSURE_UNIT) if v is not None and u else v
+    def _fallback_unit(self, kind: str) -> str:
+        """Return the configured Home Assistant unit for a measurement kind."""
+        units = self.hass.config.units
+        converter, canonical = _CONVERTERS[kind]
+        attr_candidates = {
+            "temperature": ("temperature_unit",),
+            "pressure": ("pressure_unit",),
+            "speed": ("wind_speed_unit",),
+            "distance": ("length_unit",),
+            "precipitation": ("accumulated_precipitation_unit", "accumulated_precipitation", "length_unit"),
+        }
+        for attr in attr_candidates.get(kind, ()):
+            value = getattr(units, attr, None)
+            if value:
+                return value
+        return canonical
 
-    @staticmethod
-    def _convert_speed(v: float | None, u: str | None) -> float | None:
-        return SpeedConverter.convert(v, u, CANONICAL_SPEED_UNIT) if v is not None and u else v
+    def _normalize(
+        self,
+        value: float | None,
+        reported_unit: str | None,
+        kind: str,
+        *,
+        context: str = "",
+    ) -> float | None:
+        """Normalize a single value of a given measurement kind to its canonical unit."""
+        if value is None:
+            return None
 
-    @staticmethod
-    def _convert_distance(v: float | None, u: str | None) -> float | None:
-        return DistanceConverter.convert(v, u, CANONICAL_DISTANCE_UNIT) if v is not None and u else v
+        converter, canonical = _CONVERTERS[kind]
+        unit = reported_unit or self._fallback_unit(kind)
 
-    @staticmethod
-    def _convert_precipitation(v: float | None, u: str | None) -> float | None:
-        # Precipitation depth is treated as millimeters canonical
-        return DistanceConverter.convert(v, u, CANONICAL_PRECIPITATION_UNIT) if v is not None and u else v
+        if unit == canonical:
+            return value
+
+        try:
+            return converter.convert(value, unit, canonical)
+        except Exception as err:  # noqa: BLE001 - defend against any bad/unknown unit string
+            _LOGGER.debug(
+                "Skipping unconvertible %s value (%s %s -> %s) from %s: %s",
+                kind,
+                value,
+                unit,
+                canonical,
+                context,
+                err,
+            )
+            return None
+
+    # --- Forecast fetching ---------------------------------------------------
 
     async def _async_update_forecasts(self) -> None:
+        """Fetch forecasts from all sources, auto-discovering daily/hourly support."""
         supports_daily: list[str] = []
         supports_hourly: list[str] = []
+
         for source in self._sources:
-            if (state := self.hass.states.get(source)):
-                feat = state.attributes.get("supported_features", 0)
-                if feat & WeatherEntityFeature.FORECAST_DAILY:
-                    supports_daily.append(source)
-                if feat & WeatherEntityFeature.FORECAST_HOURLY:
-                    supports_hourly.append(source)
-
-        # For each forecast type, call the weather.get_forecasts service for the relevant targets.
-        for f_type in ["daily", "hourly"]:
-            targets = supports_daily if f_type == "daily" else supports_hourly
-            if not targets:
+            state = self.hass.states.get(source)
+            if state is None:
+                _LOGGER.warning("Weather source %s not found, skipping.", source)
                 continue
-            try:
-                resp = await self.hass.services.async_call(
-                    "weather",
-                    "get_forecasts",
-                    {"type": f_type},
-                    return_response=True,
-                    target={"entity_id": targets},
-                )
-                for src in targets:
-                    if src not in resp:
-                        # No response for this source
-                        if (src, f_type) in self._forecast_cache:
-                            del self._forecast_cache[(src, f_type)]
-                        continue
+            supported = state.attributes.get("supported_features", 0)
+            if supported & WeatherEntityFeature.FORECAST_DAILY:
+                supports_daily.append(source)
+            if supported & WeatherEntityFeature.FORECAST_HOURLY:
+                supports_hourly.append(source)
 
-                    state = self.hass.states.get(src)
-                    attrs = state.attributes if state else {}
-                    raw_forecast = resp[src].get("forecast", []) or []
+        await self._async_fetch_forecast_type(supports_daily, "daily")
+        await self._async_fetch_forecast_type(supports_hourly, "hourly")
 
-                    # Normalize and optionally filter slots
-                    normalized_slots: list[dict[str, Any]] = []
-                    for slot in raw_forecast:
-                        raw_time = slot.get(ATTR_FORECAST_TIME)
-                        norm_time = _normalize_time_to_iso_z(raw_time)
-                        if norm_time is None:
-                            # Skip slots without a parseable time
-                            continue
+        # Drop cached forecasts for sources that no longer support/return
+        # them, so stale data can't linger and misalign future aggregation.
+        still_valid = set(supports_daily) | set(supports_hourly)
+        for source in list(self._forecast_cache):
+            if source not in still_valid:
+                self._forecast_cache.pop(source, None)
+                self._forecast_cache_type.pop(source, None)
 
-                        # For hourly forecasts, only keep whole-hour slots (minute == 0)
-                        if f_type == "hourly":
-                            dt = _parse_iso_datetime(raw_time)
-                            if dt is None:
-                                continue
-                            if dt.minute != 0:
-                                continue
-
-                        # For daily forecasts we accept the slot as-is (we'll reduce per-source-per-day later)
-                        s_copy = dict(slot)
-                        s_copy[ATTR_FORECAST_TIME] = norm_time
-                        normalized_slots.append(s_copy)
-
-                    # If there are normalized slots, store them sorted by time
-                    if normalized_slots:
-                        normalized_slots.sort(key=lambda s: _parse_iso_datetime(s.get(ATTR_FORECAST_TIME)) or datetime.min.replace(tzinfo=timezone.utc))
-                        self._forecast_cache[(src, f_type)] = {
-                            "data": normalized_slots,
-                            "units": {
-                                ATTR_TEMPERATURE_UNIT: attrs.get(ATTR_TEMPERATURE_UNIT),
-                                ATTR_WIND_SPEED_UNIT: attrs.get(ATTR_WIND_SPEED_UNIT),
-                                ATTR_PRECIPITATION_UNIT: attrs.get(ATTR_PRECIPITATION_UNIT),
-                            },
-                        }
-                    else:
-                        # Remove any previous cache for this source/type if no valid slots now
-                        if (src, f_type) in self._forecast_cache:
-                            del self._forecast_cache[(src, f_type)]
-            except Exception as e:
-                _LOGGER.error("Error fetching %s forecasts: %s", f_type, e)
-
-        feat = WeatherEntityFeature(0)
+        features = WeatherEntityFeature(0)
         if supports_daily:
-            feat |= WeatherEntityFeature.FORECAST_DAILY
+            features |= WeatherEntityFeature.FORECAST_DAILY
         if supports_hourly:
-            feat |= WeatherEntityFeature.FORECAST_HOURLY
-        self._attr_supported_features = feat
+            features |= WeatherEntityFeature.FORECAST_HOURLY
+        self._attr_supported_features = features
+
+        _LOGGER.debug(
+            "Forecast sources — daily: %s, hourly: %s", supports_daily, supports_hourly
+        )
+
+    async def _async_fetch_forecast_type(
+        self, sources: list[str], forecast_type: str
+    ) -> None:
+        """Fetch and cache a single forecast type for the given sources."""
+        if not sources:
+            return
+
+        try:
+            response = await self.hass.services.async_call(
+                "weather",
+                "get_forecasts",
+                {"type": forecast_type},
+                blocking=True,
+                return_response=True,
+                target={"entity_id": sources},
+            )
+        except Exception as err:  # noqa: BLE001 - external service call
+            _LOGGER.error("Error fetching %s forecasts: %s", forecast_type, err)
+            return
+
+        if not response:
+            return
+
+        for source in sources:
+            if source not in response:
+                continue
+            self._forecast_cache[source] = response[source].get("forecast", [])
+            self._forecast_cache_type[source] = forecast_type
+
+    # --- Current condition source access -------------------------------------
 
     def _get_source_states(self) -> list[State]:
-        return [s for src in self._sources if (s := self.hass.states.get(src)) and s.state not in ("unavailable", "unknown")]
+        """Return state objects for all available sources."""
+        states = []
+        for source in self._sources:
+            state = self.hass.states.get(source)
+            if state and state.state not in ("unavailable", "unknown"):
+                states.append(state)
+        return states
 
-    def _converted_attr(self, attr: str, unit_attr: str, conv: Any) -> list[float]:
-        return [
-            c
-            for s in self._get_source_states()
-            if (r := _to_float(s.attributes.get(attr))) is not None
-            and (c := conv(r, s.attributes.get(unit_attr))) is not None
-        ]
+    def _converted_attr_from_sources(
+        self,
+        attribute: str,
+        unit_attribute: str,
+        kind: str,
+    ) -> list[float]:
+        """Collect a numeric attribute from all sources, each normalized using its own unit."""
+        values: list[float] = []
+        for state in self._get_source_states():
+            raw = _to_float(state.attributes.get(attribute))
+            if raw is None:
+                continue
+            unit = state.attributes.get(unit_attribute)
+            normalized = self._normalize(
+                raw, unit, kind, context=f"{state.entity_id}.{attribute}"
+            )
+            if normalized is not None:
+                values.append(normalized)
+        return values
+
+    # --- Current conditions ---------------------------------------------------
 
     @property
     def native_temperature(self) -> float | None:
-        return _median(self._converted_attr("temperature", ATTR_TEMPERATURE_UNIT, self._convert_temperature))
+        return _median(
+            self._converted_attr_from_sources(
+                "temperature", ATTR_TEMPERATURE_UNIT, "temperature"
+            )
+        )
 
     @property
     def native_apparent_temperature(self) -> float | None:
-        return _median(self._converted_attr("apparent_temperature", ATTR_TEMPERATURE_UNIT, self._convert_temperature))
-
-    @property
-    def humidity(self) -> float | None:
-        return _median([v for s in self._get_source_states() if (v := _to_float(s.attributes.get("humidity"))) is not None])
-
-    @property
-    def native_wind_speed(self) -> float | None:
-        return _median(self._converted_attr("wind_speed", ATTR_WIND_SPEED_UNIT, self._convert_speed))
-
-    @property
-    def wind_bearing(self) -> float | None:
-        return _circular_median([v for s in self._get_source_states() if (v := _to_float(s.attributes.get("wind_bearing"))) is not None])
-
-    @property
-    def native_wind_gust_speed(self) -> float | None:
-        return _median(self._converted_attr("wind_gust_speed", ATTR_WIND_SPEED_UNIT, self._convert_speed))
-
-    @property
-    def native_pressure(self) -> float | None:
-        return _median(self._converted_attr("pressure", ATTR_PRESSURE_UNIT, self._convert_pressure))
-
-    @property
-    def native_visibility(self) -> float | None:
-        return _median(self._converted_attr("visibility", ATTR_VISIBILITY_UNIT, self._convert_distance))
-
-    @property
-    def uv_index(self) -> float | None:
-        return _median([v for s in self._get_source_states() if (v := _to_float(s.attributes.get("uv_index"))) is not None])
+        return _median(
+            self._converted_attr_from_sources(
+                "apparent_temperature", ATTR_TEMPERATURE_UNIT, "temperature"
+            )
+        )
 
     @property
     def dew_point(self) -> float | None:
-        return _median(self._converted_attr("dew_point", ATTR_TEMPERATURE_UNIT, self._convert_temperature))
+        return _median(
+            self._converted_attr_from_sources(
+                "dew_point", ATTR_TEMPERATURE_UNIT, "temperature"
+            )
+        )
+
+    @property
+    def humidity(self) -> float | None:
+        # Humidity is always a percentage — no unit conversion applies.
+        values = [
+            v
+            for state in self._get_source_states()
+            if (v := _to_float(state.attributes.get("humidity"))) is not None
+        ]
+        return _median(values)
+
+    @property
+    def native_wind_speed(self) -> float | None:
+        return _median(
+            self._converted_attr_from_sources(
+                "wind_speed", ATTR_WIND_SPEED_UNIT, "speed"
+            )
+        )
+
+    @property
+    def native_wind_gust_speed(self) -> float | None:
+        return _median(
+            self._converted_attr_from_sources(
+                "wind_gust_speed", ATTR_WIND_SPEED_UNIT, "speed"
+            )
+        )
+
+    @property
+    def wind_bearing(self) -> float | None:
+        # Bearings are always degrees — no unit conversion applies.
+        values = [
+            v
+            for state in self._get_source_states()
+            if (v := _to_float(state.attributes.get("wind_bearing"))) is not None
+        ]
+        return _circular_median(values)
+
+    @property
+    def native_pressure(self) -> float | None:
+        return _median(
+            self._converted_attr_from_sources(
+                "pressure", ATTR_PRESSURE_UNIT, "pressure"
+            )
+        )
+
+    @property
+    def native_visibility(self) -> float | None:
+        return _median(
+            self._converted_attr_from_sources(
+                "visibility", ATTR_VISIBILITY_UNIT, "distance"
+            )
+        )
+
+    @property
+    def uv_index(self) -> float | None:
+        # UV index is a dimensionless scale — no unit conversion applies.
+        values = [
+            v
+            for state in self._get_source_states()
+            if (v := _to_float(state.attributes.get("uv_index"))) is not None
+        ]
+        return _median(values)
 
     @property
     def condition(self) -> str | None:
-        return _majority_vote([s.state for s in self._get_source_states() if s.state not in ("unavailable", "unknown", "")])
+        conditions = [
+            state.state
+            for state in self._get_source_states()
+            if state.state not in ("unavailable", "unknown", "")
+        ]
+        return _majority_vote(conditions)
 
-    def _build_median_forecast(self, f_type: str) -> list[Forecast]:
-        # Build list of available sources that have cached forecasts for this type
-        available = []
-        for src in self._sources:
-            key = (src, f_type)
-            if key in self._forecast_cache:
-                data = self._forecast_cache[key]["data"]
-                units = self._forecast_cache[key]["units"]
-                # data is already sorted when cached
-                available.append((src, data, units))
+    # --- Forecasts ---------------------------------------------------------
+
+    def _forecast_slot_units(self, source: str) -> dict[str, str | None]:
+        """Return the per-measurement units this source's forecast values are in.
+
+        Per the Home Assistant weather.get_forecasts schema, forecast values
+        are expressed in the unit indicated by that source's own current-state
+        unit attributes (e.g. temperature_unit) — not necessarily the same
+        unit another source uses.
+        """
+        state = self.hass.states.get(source)
+        attrs = state.attributes if state else {}
+        return {
+            "temperature": attrs.get(ATTR_TEMPERATURE_UNIT),
+            "speed": attrs.get(ATTR_WIND_SPEED_UNIT),
+            "precipitation": attrs.get(ATTR_PRECIPITATION_UNIT),
+        }
+
+    def _build_median_forecast(self, forecast_type: str) -> list[Forecast]:
+        """Build a median forecast from all cached sources for the given type.
+
+        Each cached forecast stays paired with its source entity_id, so a
+        provider that lacks a forecast (or a matching time slot) is simply
+        skipped for that slot rather than shifting or misaligning the rest.
+        Every value is normalized using *that specific source's* reported
+        unit before being included in the median.
+        """
+        available: list[tuple[str, list[dict]]] = [
+            (source, cached)
+            for source in self._sources
+            if self._forecast_cache_type.get(source) == forecast_type
+            and (cached := self._forecast_cache.get(source))
+        ]
 
         if not available:
             return []
 
-        # DAILY: special handling to ensure 5 days if possible, otherwise use longest available
-        # IMPORTANT: only sources that provided daily forecasts (cached under 'daily') are considered here.
-        if f_type == "daily":
-            # For each source, reduce multiple slots per date to a single representative slot.
-            # Representative slot chosen as the slot with time closest to 12:00 UTC (midday).
-            per_source_best_slot: dict[str, dict[date, dict[str, Any]]] = {}
-            all_dates: set[date] = set()
-            for src, slots, _ in available:
-                best_for_dates: dict[date, dict[str, Any]] = {}
-                for slot in slots:
-                    dt = _parse_iso_datetime(slot.get(ATTR_FORECAST_TIME))
-                    if dt is None:
-                        continue
-                    d = dt.date()
-                    all_dates.add(d)
-                    # compute minutes from midnight and distance to 12:00 (720 minutes)
-                    minutes = dt.hour * 60 + dt.minute
-                    distance = abs(minutes - 720)
-                    # store slot with smallest distance to midday
-                    existing = best_for_dates.get(d)
-                    if existing is None:
-                        s_copy = dict(slot)
-                        s_copy["_midday_distance"] = distance
-                        best_for_dates[d] = s_copy
-                    else:
-                        if distance < existing.get("_midday_distance", 999999):
-                            s_copy = dict(slot)
-                            s_copy["_midday_distance"] = distance
-                            best_for_dates[d] = s_copy
-                per_source_best_slot[src] = best_for_dates
+        # Use the first available source purely as the datetime spine —
+        # every provider's own values are looked up and normalized
+        # independently per slot.
+        _, lead = available[0]
+        result: list[Forecast] = []
 
-            # Determine desired number of days: 5 if any source has 5 or more unique dates, else max length among sources
-            max_len = max((len(dates) for dates in (list(d.keys()) for d in per_source_best_slot.values())), default=0)
-            desired_count = 5 if any(len(dates) >= 5 for dates in (list(d.keys()) for d in per_source_best_slot.values())) else max_len
-
-            if desired_count == 0:
-                return []
-
-            # Choose the earliest desired_count dates from the union of dates
-            union_dates_sorted = sorted(all_dates)
-            chosen_dates = union_dates_sorted[:desired_count]
-
-            res: list[Forecast] = []
-            for chosen_date in chosen_dates:
-                # Build a canonical ISO Z time for the date (midnight UTC)
-                dt_midnight = datetime(chosen_date.year, chosen_date.month, chosen_date.day, 0, 0, tzinfo=timezone.utc)
-                dt_iso = dt_midnight.isoformat().replace("+00:00", "Z")
-
-                temps, templows, winds, bearings, precips, humids, conds = [], [], [], [], [], [], []
-                for src, _, units in available:
-                    best_slots_for_src = per_source_best_slot.get(src, {})
-                    slot = best_slots_for_src.get(chosen_date)
-                    if not slot:
-                        continue
-                    # extract values from the representative slot (ignore internal _midday_distance)
-                    if (v := _to_float(slot.get(ATTR_FORECAST_TEMP))) is not None and (c := self._convert_temperature(v, units.get(ATTR_TEMPERATURE_UNIT))) is not None:
-                        temps.append(c)
-                    if (v := _to_float(slot.get(ATTR_FORECAST_TEMP_LOW))) is not None and (c := self._convert_temperature(v, units.get(ATTR_TEMPERATURE_UNIT))) is not None:
-                        templows.append(c)
-                    if (v := _to_float(slot.get(ATTR_FORECAST_WIND_SPEED))) is not None and (c := self._convert_speed(v, units.get(ATTR_WIND_SPEED_UNIT))) is not None:
-                        winds.append(c)
-                    if (v := _to_float(slot.get(ATTR_FORECAST_WIND_BEARING))) is not None:
-                        bearings.append(v)
-                    if (v := _to_float(slot.get(ATTR_FORECAST_PRECIPITATION))) is not None and (c := self._convert_precipitation(v, units.get(ATTR_PRECIPITATION_UNIT))) is not None:
-                        precips.append(c)
-                    if (v := _to_float(slot.get(ATTR_FORECAST_HUMIDITY))) is not None:
-                        humids.append(v)
-                    if (v := slot.get(ATTR_FORECAST_CONDITION)):
-                        conds.append(str(v))
-
-                ent: Forecast = {ATTR_FORECAST_TIME: dt_iso}
-                if (v := _median(temps)) is not None:
-                    ent[ATTR_FORECAST_TEMP] = round(v, 1)
-                if (v := _median(templows)) is not None:
-                    ent[ATTR_FORECAST_TEMP_LOW] = round(v, 1)
-                if (v := _median(winds)) is not None:
-                    ent[ATTR_FORECAST_WIND_SPEED] = round(v, 1)
-                if (v := _circular_median(bearings)) is not None:
-                    ent[ATTR_FORECAST_WIND_BEARING] = round(v, 1)
-                if (v := _median(precips)) is not None:
-                    ent[ATTR_FORECAST_PRECIPITATION] = round(v, 2)
-                if (v := _median(humids)) is not None:
-                    ent[ATTR_FORECAST_HUMIDITY] = round(v, 1)
-                if (v := _majority_vote(conds)) is not None:
-                    ent[ATTR_FORECAST_CONDITION] = v
-                res.append(ent)
-            return res
-
-        # HOURLY: use lead timeline (already filtered to whole-hour slots when cached)
-        lead = available[0][1]
-        res: list[Forecast] = []
-        for l_slot in lead:
-            dt_norm = l_slot.get(ATTR_FORECAST_TIME)
-            if not dt_norm:
+        for lead_slot in lead:
+            dt = lead_slot.get(ATTR_FORECAST_TIME)
+            if not dt:
                 continue
-            temps, templows, winds, bearings, precips, humids, conds = [], [], [], [], [], [], []
-            for src, slots, units in available:
-                slot = next((s for s in slots if s.get(ATTR_FORECAST_TIME) == dt_norm), None)
-                if not slot:
-                    continue
-                if (v := _to_float(slot.get(ATTR_FORECAST_TEMP))) is not None and (c := self._convert_temperature(v, units.get(ATTR_TEMPERATURE_UNIT))) is not None:
-                    temps.append(c)
-                if (v := _to_float(slot.get(ATTR_FORECAST_TEMP_LOW))) is not None and (c := self._convert_temperature(v, units.get(ATTR_TEMPERATURE_UNIT))) is not None:
-                    templows.append(c)
-                if (v := _to_float(slot.get(ATTR_FORECAST_WIND_SPEED))) is not None and (c := self._convert_speed(v, units.get(ATTR_WIND_SPEED_UNIT))) is not None:
-                    winds.append(c)
-                if (v := _to_float(slot.get(ATTR_FORECAST_WIND_BEARING))) is not None:
-                    bearings.append(v)
-                if (v := _to_float(slot.get(ATTR_FORECAST_PRECIPITATION))) is not None and (c := self._convert_precipitation(v, units.get(ATTR_PRECIPITATION_UNIT))) is not None:
-                    precips.append(c)
-                if (v := _to_float(slot.get(ATTR_FORECAST_HUMIDITY))) is not None:
-                    humids.append(v)
-                if (v := slot.get(ATTR_FORECAST_CONDITION)):
-                    conds.append(str(v))
 
-            ent: Forecast = {ATTR_FORECAST_TIME: dt_norm}
+            temps, templows, dew_points, winds, bearings, precips, humids, uv_indices, conditions = (
+                [], [], [], [], [], [], [], [], []
+            )
+
+            for source, forecast_slots in available:
+                slot = next(
+                    (s for s in forecast_slots if s.get(ATTR_FORECAST_TIME) == dt),
+                    None,
+                )
+                if slot is None:
+                    continue
+
+                units = self._forecast_slot_units(source)
+                context = f"{source} forecast[{dt}]"
+
+                if (v := _to_float(slot.get(ATTR_FORECAST_TEMP))) is not None:
+                    if (c := self._normalize(v, units["temperature"], "temperature", context=context)) is not None:
+                        temps.append(c)
+                if (v := _to_float(slot.get(ATTR_FORECAST_TEMP_LOW))) is not None:
+                    if (c := self._normalize(v, units["temperature"], "temperature", context=context)) is not None:
+                        templows.append(c)
+                if (v := _to_float(slot.get("dew_point"))) is not None:
+                    if (c := self._normalize(v, units["temperature"], "temperature", context=context)) is not None:
+                        dew_points.append(c)
+                if (v := _to_float(slot.get(ATTR_FORECAST_WIND_SPEED))) is not None:
+                    if (c := self._normalize(v, units["speed"], "speed", context=context)) is not None:
+                        winds.append(c)
+                if (v := _to_float(slot.get(ATTR_FORECAST_WIND_BEARING))) is not None:
+                    bearings.append(v)  # degrees — no unit conversion applies
+                if (v := _to_float(slot.get(ATTR_FORECAST_PRECIPITATION))) is not None:
+                    if (c := self._normalize(v, units["precipitation"], "precipitation", context=context)) is not None:
+                        precips.append(c)
+                if (v := _to_float(slot.get(ATTR_FORECAST_HUMIDITY))) is not None:
+                    humids.append(v)  # percentage — no unit conversion applies
+                if (v := _to_float(slot.get("uv_index"))) is not None:
+                    uv_indices.append(v)  # dimensionless — no unit conversion applies
+                if (v := slot.get(ATTR_FORECAST_CONDITION)) is not None:
+                    conditions.append(str(v))
+
+            entry: Forecast = {ATTR_FORECAST_TIME: dt}
+
             if (v := _median(temps)) is not None:
-                ent[ATTR_FORECAST_TEMP] = round(v, 1)
+                entry[ATTR_FORECAST_TEMP] = round(v, 1)
             if (v := _median(templows)) is not None:
-                ent[ATTR_FORECAST_TEMP_LOW] = round(v, 1)
+                entry[ATTR_FORECAST_TEMP_LOW] = round(v, 1)
+            if (v := _median(dew_points)) is not None:
+                entry["dew_point"] = round(v, 1)
             if (v := _median(winds)) is not None:
-                ent[ATTR_FORECAST_WIND_SPEED] = round(v, 1)
+                entry[ATTR_FORECAST_WIND_SPEED] = round(v, 1)
             if (v := _circular_median(bearings)) is not None:
-                ent[ATTR_FORECAST_WIND_BEARING] = round(v, 1)
+                entry[ATTR_FORECAST_WIND_BEARING] = round(v, 1)
             if (v := _median(precips)) is not None:
-                ent[ATTR_FORECAST_PRECIPITATION] = round(v, 2)
+                entry[ATTR_FORECAST_PRECIPITATION] = round(v, 2)
             if (v := _median(humids)) is not None:
-                ent[ATTR_FORECAST_HUMIDITY] = round(v, 1)
-            if (v := _majority_vote(conds)) is not None:
-                ent[ATTR_FORECAST_CONDITION] = v
-            res.append(ent)
-        return res
+                entry[ATTR_FORECAST_HUMIDITY] = round(v, 1)
+            if (v := _median(uv_indices)) is not None:
+                entry["uv_index"] = round(v, 1)
+            if (v := _majority_vote(conditions)) is not None:
+                entry[ATTR_FORECAST_CONDITION] = v
+
+            result.append(entry)
+
+        return result
 
     async def async_forecast_daily(self) -> list[Forecast] | None:
         return self._build_median_forecast("daily") or None
