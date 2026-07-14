@@ -9,6 +9,7 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, OptionsFlow
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.selector import (
     EntitySelector,
     EntitySelectorConfig,
@@ -87,6 +88,17 @@ class WeatherMedianOptionsFlow(OptionsFlow):
     def __init__(self, config_entry: ConfigEntry) -> None:
         self._config_entry = config_entry
 
+    def _own_entity_id(self) -> str | None:
+        """Return this integration's own weather entity_id, if it exists yet.
+
+        Used to exclude it from the source picker — selecting your own
+        aggregated entity as one of its own sources would create a loop.
+        """
+        registry = er.async_get(self.hass)
+        return registry.async_get_entity_id(
+            "weather", DOMAIN, f"{DOMAIN}_{self._config_entry.entry_id}"
+        )
+
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
@@ -110,11 +122,18 @@ class WeatherMedianOptionsFlow(OptionsFlow):
             else:
                 errors["base"] = error
 
+        own_entity_id = self._own_entity_id()
+        exclude_entities = [own_entity_id] if own_entity_id else []
+
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema({
                 vol.Required(CONF_SOURCES, default=current_sources): EntitySelector(
-                    EntitySelectorConfig(domain="weather", multiple=True)
+                    EntitySelectorConfig(
+                        domain="weather",
+                        multiple=True,
+                        exclude_entities=exclude_entities,
+                    )
                 ),
                 vol.Required(CONF_UPDATE_INTERVAL, default=current_interval): NumberSelector(
                     NumberSelectorConfig(min=5, max=1440, step=5, mode=NumberSelectorMode.BOX, unit_of_measurement="min")
