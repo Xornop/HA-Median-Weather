@@ -93,19 +93,33 @@ class WeatherMedianOptionsFlow(OptionsFlow):
 
         Used to exclude it from the source picker — selecting your own
         aggregated entity as one of its own sources would create a loop.
+        Any failure here is non-fatal: we simply don't exclude anything,
+        rather than let the whole form fail to render.
         """
-        registry = er.async_get(self.hass)
-        return registry.async_get_entity_id(
-            "weather", DOMAIN, f"{DOMAIN}_{self._config_entry.entry_id}"
-        )
+        try:
+            registry = er.async_get(self.hass)
+            return registry.async_get_entity_id(
+                "weather", DOMAIN, f"{DOMAIN}_{self._config_entry.entry_id}"
+            )
+        except Exception as err:  # noqa: BLE001 - form must still render
+            _LOGGER.debug("Could not resolve own entity_id for exclusion: %s", err)
+            return None
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         errors: dict[str, str] = {}
 
-        current_sources: list[str] = self._config_entry.data.get(CONF_SOURCES, [])
-        current_interval: int = self._config_entry.data.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)
+        # Saved changes live in entry.options, not entry.data — entry.data
+        # only ever reflects the values from the initial setup. Prefer
+        # options so the form reflects whatever was last actually saved.
+        current_sources: list[str] = self._config_entry.options.get(
+            CONF_SOURCES, self._config_entry.data.get(CONF_SOURCES, [])
+        )
+        current_interval: int = self._config_entry.options.get(
+            CONF_UPDATE_INTERVAL,
+            self._config_entry.data.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL),
+        )
 
         if user_input is not None:
             sources: list[str] = user_input[CONF_SOURCES]
@@ -123,7 +137,14 @@ class WeatherMedianOptionsFlow(OptionsFlow):
                 errors["base"] = error
 
         own_entity_id = self._own_entity_id()
-        exclude_entities = [own_entity_id] if own_entity_id else []
+        # Never exclude an entity the user has already selected — only
+        # exclude it if it isn't already part of the current sources, so a
+        # pre-existing (already saved) self-reference doesn't lock the form.
+        exclude_entities = (
+            [own_entity_id]
+            if own_entity_id and own_entity_id not in current_sources
+            else []
+        )
 
         return self.async_show_form(
             step_id="init",
