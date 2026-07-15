@@ -31,6 +31,7 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import (
     BaseUnitConverter,
     DistanceConverter,
@@ -478,6 +479,54 @@ class WeatherMedianEntity(WeatherEntity):
             "precipitation": attrs.get(ATTR_PRECIPITATION_UNIT),
         }
 
+    @staticmethod
+    def _parse_forecast_dt(value: str) -> Any | None:
+        """Parse a forecast timestamp to a timezone-aware UTC datetime.
+
+        Providers don't all format timestamps identically (different offset
+        notation, different timezone) even when they mean the exact same
+        moment. Comparing the raw strings for equality is unreliable —
+        parsing to an actual datetime and normalizing to UTC is not.
+        """
+        parsed = dt_util.parse_datetime(value)
+        if parsed is None:
+            return None
+        return dt_util.as_utc(parsed)
+
+    def _forecast_match_key(self, value: str, forecast_type: str) -> Any | None:
+        """Return a key used to align the same forecast slot across sources.
+
+        Daily forecasts are matched by calendar date in local time, since
+        providers may timestamp "the forecast for a day" at midnight, noon,
+        or some other anchor while still meaning the same day. Hourly
+        forecasts are matched by UTC instant, rounded to the nearest 5
+        minutes to tolerate small scheduling differences between providers.
+        """
+        parsed = self._parse_forecast_dt(value)
+        if parsed is None:
+            return None
+        if forecast_type == "daily":
+            return dt_util.as_local(parsed).date()
+        rounded_minute = (parsed.minute // 5) * 5
+        return parsed.replace(minute=rounded_minute, second=0, microsecond=0)
+
+    def _index_forecast_by_match_key(
+        self, forecast_slots: list[dict], forecast_type: str
+    ) -> dict[Any, dict]:
+        """Index a source's forecast slots by their alignment key for O(1) lookup."""
+        index: dict[Any, dict] = {}
+        for slot in forecast_slots:
+            raw_dt = slot.get(ATTR_FORECAST_TIME)
+            if not raw_dt:
+                continue
+            key = self._forecast_match_key(raw_dt, forecast_type)
+            if key is None:
+                continue
+            # First occurrence wins if a source ever reports duplicate slots
+            # for the same aligned key.
+            index.setdefault(key, slot)
+        return index
+
     def _build_median_forecast(self, forecast_type: str) -> list[Forecast]:
         """Build a median forecast from all cached sources for the given type.
 
@@ -498,9 +547,14 @@ class WeatherMedianEntity(WeatherEntity):
             return []
 
         # Use the first available source purely as the datetime spine —
-        # every provider's own values are looked up and normalized
+        # every provider's own values are looked up (via a normalized
+        # alignment key, not raw string equality) and normalized
         # independently per slot.
-        _, lead = available[0]
+        lead_source, lead = available[0]
+        indices: dict[str, dict[Any, dict]] = {
+            source: self._index_forecast_by_match_key(slots, forecast_type)
+            for source, slots in available
+        }
         result: list[Forecast] = []
 
         for lead_slot in lead:
@@ -508,15 +562,16 @@ class WeatherMedianEntity(WeatherEntity):
             if not dt:
                 continue
 
+            lead_key = self._forecast_match_key(dt, forecast_type)
+            if lead_key is None:
+                continue
+
             temps, templows, dew_points, winds, bearings, precips, humids, uv_indices, conditions = (
                 [], [], [], [], [], [], [], [], []
             )
 
-            for source, forecast_slots in available:
-                slot = next(
-                    (s for s in forecast_slots if s.get(ATTR_FORECAST_TIME) == dt),
-                    None,
-                )
+            for source, _slots in available:
+                slot = indices[source].get(lead_key)
                 if slot is None:
                     continue
 
