@@ -31,6 +31,7 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import (
     BaseUnitConverter,
     DistanceConverter,
@@ -173,8 +174,10 @@ class WeatherMedianEntity(WeatherEntity):
         # Cache keyed by source entity_id -> list of raw forecast dicts.
         # Sources that don't support a forecast type simply have no entry,
         # so a missing provider never shifts or misaligns the others.
-        self._forecast_cache: dict[str, list[dict]] = {}
-        self._forecast_cache_type: dict[str, str] = {}
+        # Cache keyed by (source entity_id, forecast_type) -> raw forecast
+        # slots. Keying by source alone would let a source that supports
+        # both daily and hourly silently overwrite one with the other.
+        self._forecast_cache: dict[tuple[str, str], list[dict]] = {}
 
         self._attr_supported_features = WeatherEntityFeature(0)
         self._remove_time_listener = None
@@ -286,11 +289,14 @@ class WeatherMedianEntity(WeatherEntity):
 
         # Drop cached forecasts for sources that no longer support/return
         # them, so stale data can't linger and misalign future aggregation.
-        still_valid = set(supports_daily) | set(supports_hourly)
-        for source in list(self._forecast_cache):
-            if source not in still_valid:
-                self._forecast_cache.pop(source, None)
-                self._forecast_cache_type.pop(source, None)
+        still_valid_daily = set(supports_daily)
+        still_valid_hourly = set(supports_hourly)
+        for key in list(self._forecast_cache):
+            source, ftype = key
+            if ftype == "daily" and source not in still_valid_daily:
+                self._forecast_cache.pop(key, None)
+            elif ftype == "hourly" and source not in still_valid_hourly:
+                self._forecast_cache.pop(key, None)
 
         features = WeatherEntityFeature(0)
         if supports_daily:
@@ -329,8 +335,7 @@ class WeatherMedianEntity(WeatherEntity):
         for source in sources:
             if source not in response:
                 continue
-            self._forecast_cache[source] = response[source].get("forecast", [])
-            self._forecast_cache_type[source] = forecast_type
+            self._forecast_cache[(source, forecast_type)] = response[source].get("forecast", [])
 
     # --- Current condition source access -------------------------------------
 
@@ -478,6 +483,56 @@ class WeatherMedianEntity(WeatherEntity):
             "precipitation": attrs.get(ATTR_PRECIPITATION_UNIT),
         }
 
+    @staticmethod
+    def _parse_forecast_dt(value: str) -> Any | None:
+        """Parse a forecast timestamp to a timezone-aware UTC datetime.
+
+        Providers don't all format timestamps identically (different offset
+        notation, different timezone) even when they mean the exact same
+        moment. Comparing the raw strings for equality is unreliable —
+        parsing to an actual datetime and normalizing to UTC is not.
+        """
+        parsed = dt_util.parse_datetime(value)
+        if parsed is None:
+            return None
+        return dt_util.as_utc(parsed)
+
+    def _forecast_match_key(self, value: str, forecast_type: str) -> Any | None:
+        """Return a key used to align the same forecast slot across sources.
+
+        Daily forecasts are matched by calendar date in local time, since
+        providers may timestamp "the forecast for a day" at midnight, noon,
+        or some other anchor while still meaning the same day. Hourly
+        forecasts are matched by truncating to the top of the UTC hour —
+        providers commonly stagger the exact minute of their hourly slots
+        (:00, :03, :07, ...), so matching on the hour itself (rather than a
+        finer rounding bucket) reliably aligns the same real-world hour
+        across sources.
+        """
+        parsed = self._parse_forecast_dt(value)
+        if parsed is None:
+            return None
+        if forecast_type == "daily":
+            return dt_util.as_local(parsed).date()
+        return parsed.replace(minute=0, second=0, microsecond=0)
+
+    def _index_forecast_by_match_key(
+        self, forecast_slots: list[dict], forecast_type: str
+    ) -> dict[Any, dict]:
+        """Index a source's forecast slots by their alignment key for O(1) lookup."""
+        index: dict[Any, dict] = {}
+        for slot in forecast_slots:
+            raw_dt = slot.get(ATTR_FORECAST_TIME)
+            if not raw_dt:
+                continue
+            key = self._forecast_match_key(raw_dt, forecast_type)
+            if key is None:
+                continue
+            # First occurrence wins if a source ever reports duplicate slots
+            # for the same aligned key.
+            index.setdefault(key, slot)
+        return index
+
     def _build_median_forecast(self, forecast_type: str) -> list[Forecast]:
         """Build a median forecast from all cached sources for the given type.
 
@@ -490,17 +545,21 @@ class WeatherMedianEntity(WeatherEntity):
         available: list[tuple[str, list[dict]]] = [
             (source, cached)
             for source in self._sources
-            if self._forecast_cache_type.get(source) == forecast_type
-            and (cached := self._forecast_cache.get(source))
+            if (cached := self._forecast_cache.get((source, forecast_type)))
         ]
 
         if not available:
             return []
 
         # Use the first available source purely as the datetime spine —
-        # every provider's own values are looked up and normalized
+        # every provider's own values are looked up (via a normalized
+        # alignment key, not raw string equality) and normalized
         # independently per slot.
-        _, lead = available[0]
+        lead_source, lead = available[0]
+        indices: dict[str, dict[Any, dict]] = {
+            source: self._index_forecast_by_match_key(slots, forecast_type)
+            for source, slots in available
+        }
         result: list[Forecast] = []
 
         for lead_slot in lead:
@@ -508,15 +567,16 @@ class WeatherMedianEntity(WeatherEntity):
             if not dt:
                 continue
 
+            lead_key = self._forecast_match_key(dt, forecast_type)
+            if lead_key is None:
+                continue
+
             temps, templows, dew_points, winds, bearings, precips, humids, uv_indices, conditions = (
                 [], [], [], [], [], [], [], [], []
             )
 
-            for source, forecast_slots in available:
-                slot = next(
-                    (s for s in forecast_slots if s.get(ATTR_FORECAST_TIME) == dt),
-                    None,
-                )
+            for source, _slots in available:
+                slot = indices[source].get(lead_key)
                 if slot is None:
                     continue
 
